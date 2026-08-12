@@ -1,35 +1,48 @@
-const DEFAULT_PINS = [
-  {
-    name: "Gmail",
-    url: "https://mail.google.com/"
-  },
-  {
-    name: "Calendar",
-    url: "https://calendar.google.com/"
-  },
-  {
-    name: "ChatGPT",
-    url: "https://chatgpt.com/"
-  }
-];
+const STATE_VERSION = 4;
+const UNPIN_DELAY_MS = 700;
+const SUPPRESSION_MS = 3000;
 
-async function getPinnedSites() {
-  const result = await chrome.storage.local.get("pinnedSites");
+let queue = Promise.resolve();
 
-  if (result.pinnedSites) {
-    return result.pinnedSites;
-  }
+const suppressedChanges = new Map();
 
-  await chrome.storage.local.set({
-    pinnedSites: DEFAULT_PINS
-  });
+function enqueue(fn) {
+  queue = queue
+    .then(fn)
+    .catch(error => {
+      console.error("Arcify:", error);
+    });
 
-  return DEFAULT_PINS;
+  return queue;
 }
 
-function getHostname(url) {
-  if (!url) return null;
+function getTabUrl(tab) {
+  return tab?.url || tab?.pendingUrl || null;
+}
 
+function isTrackableUrl(url) {
+  return (
+    typeof url === "string" &&
+    (
+      url.startsWith("https://") ||
+      url.startsWith("http://")
+    )
+  );
+}
+
+function siteKey(url) {
+  if (!isTrackableUrl(url)) {
+    return null;
+  }
+
+  try {
+    return new URL(url).origin;
+  } catch {
+    return null;
+  }
+}
+
+function hostname(url) {
   try {
     return new URL(url).hostname.replace(/^www\./, "");
   } catch {
@@ -37,82 +50,513 @@ function getHostname(url) {
   }
 }
 
-function sameSite(existingUrl, desiredUrl) {
-  return getHostname(existingUrl) === getHostname(desiredUrl);
+function makeSite(tab) {
+  const url = getTabUrl(tab);
+  const key = siteKey(url);
+
+  if (!key) {
+    return null;
+  }
+
+  return {
+    name: tab.title || hostname(url) || key,
+    url,
+    key
+  };
 }
 
-async function ensurePinnedTabs(windowId) {
-  const window = await chrome.windows.get(windowId);
+async function getPinnedSites() {
+  const result = await chrome.storage.local.get("pinnedSites");
 
-  if (window.type !== "normal") return;
+  if (!Array.isArray(result.pinnedSites)) {
+    return [];
+  }
 
-  const desiredPins = await getPinnedSites();
+  const seen = new Set();
+  const resultSites = [];
 
-  let existingTabs = await chrome.tabs.query({
-    windowId
+  for (const site of result.pinnedSites) {
+    if (!site || !isTrackableUrl(site.url)) {
+      continue;
+    }
+
+    const key = siteKey(site.url);
+
+    if (!key || seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+
+    resultSites.push({
+      name: site.name || hostname(site.url) || key,
+      url: site.url,
+      key
+    });
+  }
+
+  return resultSites;
+}
+
+async function savePinnedSites(sites) {
+  const seen = new Set();
+
+  const cleaned = [];
+
+  for (const site of sites) {
+    const key = siteKey(site.url);
+
+    if (!key || seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+
+    cleaned.push({
+      name: site.name || hostname(site.url) || key,
+      url: site.url,
+      key
+    });
+  }
+
+  await chrome.storage.local.set({
+    pinnedSites: cleaned,
+    arcifyStateVersion: STATE_VERSION
   });
 
-  for (let i = 0; i < desiredPins.length; i++) {
-    const desired = desiredPins[i];
+  console.log(
+    "Arcify master pins:",
+    cleaned.map(site => ({
+      name: site.name,
+      key: site.key
+    }))
+  );
+}
 
-    let existingTab = existingTabs.find(tab =>
-      sameSite(tab.url || tab.pendingUrl, desired.url)
+function suppressionKey(tabId, pinned) {
+  return `${tabId}:${pinned}`;
+}
+
+function suppress(tabId, pinned) {
+  suppressedChanges.set(
+    suppressionKey(tabId, pinned),
+    Date.now() + SUPPRESSION_MS
+  );
+}
+
+function consumeSuppression(tabId, pinned) {
+  const key = suppressionKey(tabId, pinned);
+
+  const expires = suppressedChanges.get(key);
+
+  if (!expires) {
+    return false;
+  }
+
+  suppressedChanges.delete(key);
+
+  if (Date.now() > expires) {
+    return false;
+  }
+
+  return true;
+}
+
+async function importPinsFromFocusedWindow() {
+  let window;
+
+  try {
+    window = await chrome.windows.getLastFocused();
+  } catch {
+    return [];
+  }
+
+  if (
+    !window ||
+    window.type !== "normal" ||
+    window.incognito
+  ) {
+    return [];
+  }
+
+  const tabs = await chrome.tabs.query({
+    windowId: window.id,
+    pinned: true
+  });
+
+  const sites = [];
+  const seen = new Set();
+
+  for (const tab of tabs) {
+    if (tab.incognito) {
+      continue;
+    }
+
+    const site = makeSite(tab);
+
+    if (!site || seen.has(site.key)) {
+      continue;
+    }
+
+    seen.add(site.key);
+    sites.push(site);
+  }
+
+  await savePinnedSites(sites);
+
+  console.log(
+    "Arcify imported focused window:",
+    sites.map(site => site.key)
+  );
+
+  return sites;
+}
+
+async function addPinnedSite(tab) {
+  const site = makeSite(tab);
+
+  if (!site) {
+    return false;
+  }
+
+  const sites = await getPinnedSites();
+
+  if (
+    sites.some(existing =>
+      existing.key === site.key
+    )
+  ) {
+    return false;
+  }
+
+  sites.push(site);
+
+  await savePinnedSites(sites);
+
+  console.log(
+    "Arcify learned:",
+    site.key
+  );
+
+  return true;
+}
+
+async function removePinnedSite(tab) {
+  const url = getTabUrl(tab);
+  const key = siteKey(url);
+
+  if (!key) {
+    return null;
+  }
+
+  const sites = await getPinnedSites();
+
+  const existing = sites.find(
+    site => site.key === key
+  );
+
+  if (!existing) {
+    return null;
+  }
+
+  await savePinnedSites(
+    sites.filter(
+      site => site.key !== key
+    )
+  );
+
+  console.log(
+    "Arcify forgot:",
+    key
+  );
+
+  return existing;
+}
+
+async function safelySetPinned(tabId, pinned) {
+  suppress(tabId, pinned);
+
+  try {
+    return await chrome.tabs.update(
+      tabId,
+      {
+        pinned
+      }
+    );
+  } catch (error) {
+    suppressedChanges.delete(
+      suppressionKey(tabId, pinned)
     );
 
-    if (existingTab) {
-      if (!existingTab.pinned) {
-        existingTab = await chrome.tabs.update(
-          existingTab.id,
-          { pinned: true }
+    throw error;
+  }
+}
+
+async function ensureWindow(windowId) {
+  let window;
+
+  try {
+    window =
+      await chrome.windows.get(windowId);
+  } catch {
+    return;
+  }
+
+  if (
+    window.type !== "normal" ||
+    window.incognito
+  ) {
+    return;
+  }
+
+  const sites = await getPinnedSites();
+
+  let tabs;
+
+  try {
+    tabs =
+      await chrome.tabs.query({
+        windowId
+      });
+  } catch {
+    return;
+  }
+
+  const usedTabIds = new Set();
+
+  for (
+    let index = 0;
+    index < sites.length;
+    index++
+  ) {
+    const site = sites[index];
+
+    let tab = tabs.find(candidate => {
+      if (usedTabIds.has(candidate.id)) {
+        return false;
+      }
+
+      return (
+        siteKey(getTabUrl(candidate)) ===
+        site.key
+      );
+    });
+
+    if (!tab) {
+      try {
+        tab = await chrome.tabs.create({
+          windowId,
+          url: site.url,
+          active: false,
+          index
+        });
+
+        tabs.push(tab);
+      } catch {
+        continue;
+      }
+    }
+
+    usedTabIds.add(tab.id);
+
+    try {
+      if (!tab.pinned) {
+        tab = await safelySetPinned(
+          tab.id,
+          true
         );
       }
 
-      await chrome.tabs.move(existingTab.id, {
-        index: i
-      });
-
-    } else {
-      const newTab = await chrome.tabs.create({
-        windowId,
-        url: desired.url,
-        pinned: true,
-        active: false,
-        index: i
-      });
-
-      existingTabs.push(newTab);
+      await chrome.tabs.move(
+        tab.id,
+        {
+          index
+        }
+      );
+    } catch {
     }
   }
 }
 
-chrome.windows.onCreated.addListener(window => {
-  ensurePinnedTabs(window.id).catch(console.error);
-});
-
-chrome.runtime.onStartup.addListener(async () => {
-  const windows = await chrome.windows.getAll({
-    windowTypes: ["normal"]
-  });
+async function ensureAllWindows() {
+  const windows =
+    await chrome.windows.getAll({
+      windowTypes: ["normal"]
+    });
 
   for (const window of windows) {
-    await ensurePinnedTabs(window.id);
+    if (!window.incognito) {
+      await ensureWindow(window.id);
+    }
   }
-});
+}
 
-chrome.runtime.onInstalled.addListener(async () => {
-  const result = await chrome.storage.local.get("pinnedSites");
+async function unpinSiteEverywhere(site) {
+  const windows =
+    await chrome.windows.getAll({
+      windowTypes: ["normal"]
+    });
 
-  if (!result.pinnedSites) {
-    await chrome.storage.local.set({
-      pinnedSites: DEFAULT_PINS
+  for (const window of windows) {
+    if (window.incognito) {
+      continue;
+    }
+
+    let tabs;
+
+    try {
+      tabs =
+        await chrome.tabs.query({
+          windowId: window.id
+        });
+    } catch {
+      continue;
+    }
+
+    for (const tab of tabs) {
+      if (!tab.pinned) {
+        continue;
+      }
+
+      if (
+        siteKey(getTabUrl(tab)) !==
+        site.key
+      ) {
+        continue;
+      }
+
+      try {
+        await safelySetPinned(
+          tab.id,
+          false
+        );
+      } catch {
+      }
+    }
+  }
+}
+
+async function confirmManualUnpin(tabId) {
+  let tab;
+
+  try {
+    tab =
+      await chrome.tabs.get(tabId);
+  } catch {
+    console.log(
+      "Arcify ignored closed tab/window:",
+      tabId
+    );
+
+    return;
+  }
+
+  if (
+    tab.incognito ||
+    tab.pinned
+  ) {
+    return;
+  }
+
+  const removed =
+    await removePinnedSite(tab);
+
+  if (removed) {
+    await unpinSiteEverywhere(
+      removed
+    );
+  }
+}
+
+chrome.tabs.onUpdated.addListener(
+  (tabId, changeInfo, tab) => {
+    if (
+      typeof changeInfo.pinned !==
+      "boolean"
+    ) {
+      return;
+    }
+
+    if (tab.incognito) {
+      return;
+    }
+
+    if (
+      consumeSuppression(
+        tabId,
+        changeInfo.pinned
+      )
+    ) {
+      console.log(
+        "Arcify ignored its own pin change:",
+        tabId,
+        changeInfo.pinned
+      );
+
+      return;
+    }
+
+    if (changeInfo.pinned) {
+      enqueue(async () => {
+        const added =
+          await addPinnedSite(tab);
+
+        if (added) {
+          await ensureAllWindows();
+        }
+      });
+
+      return;
+    }
+
+    setTimeout(() => {
+      enqueue(
+        () =>
+          confirmManualUnpin(tabId)
+      );
+    }, UNPIN_DELAY_MS);
+  }
+);
+
+chrome.windows.onCreated.addListener(
+  window => {
+    if (
+      window.type !== "normal" ||
+      window.incognito
+    ) {
+      return;
+    }
+
+    enqueue(
+      () => ensureWindow(window.id)
+    );
+  }
+);
+
+chrome.runtime.onStartup.addListener(
+  () => {
+    enqueue(
+      () => ensureAllWindows()
+    );
+  }
+);
+
+chrome.runtime.onInstalled.addListener(
+  () => {
+    enqueue(async () => {
+      const result =
+        await chrome.storage.local.get(
+          "arcifyStateVersion"
+        );
+
+      if (
+        result.arcifyStateVersion !==
+        STATE_VERSION
+      ) {
+        await importPinsFromFocusedWindow();
+      }
+
+      await ensureAllWindows();
     });
   }
-
-  const windows = await chrome.windows.getAll({
-    windowTypes: ["normal"]
-  });
-
-  for (const window of windows) {
-    await ensurePinnedTabs(window.id);
-  }
-});
+);
