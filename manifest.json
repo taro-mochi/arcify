@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Arcify",
+  "version": "0.1.0",
+  "description": "Persistent Arc-style pinned tabs for Chrome",
+  "permissions": [
+    "tabs",
+    "storage"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
