@@ -2,6 +2,11 @@ const PIN_SCHEMA_VERSION = 4;
 const UNPIN_DELAY_MS = 700;
 const SUPPRESSION_MS = 3000;
 
+const WINDOW_SETTLE_INTERVAL_MS = 250;
+const WINDOW_SETTLE_MAX_ATTEMPTS = 24;
+const NEW_WINDOW_RECONCILE_DELAY_MS = 300;
+const STARTUP_RECONCILE_DELAY_MS = 2000;
+
 chrome.storage.local.setAccessLevel({
   accessLevel: "TRUSTED_CONTEXTS"
 }).catch(error => {
@@ -279,12 +284,73 @@ async function safelySetPinned(tabId, pinned) {
   }
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function hasUnresolvedPinnedTabs(tabs) {
+  return tabs.some(tab => {
+    if (!tab.pinned) {
+      return false;
+    }
+
+    return siteKey(getTabUrl(tab)) === null;
+  });
+}
+
+async function waitForWindowToSettle(windowId) {
+  for (
+    let attempt = 0;
+    attempt < WINDOW_SETTLE_MAX_ATTEMPTS;
+    attempt++
+  ) {
+    let tabs;
+
+    try {
+      tabs = await chrome.tabs.query({ windowId });
+    } catch {
+      return false;
+    }
+
+    if (!hasUnresolvedPinnedTabs(tabs)) {
+      return true;
+    }
+
+    await sleep(WINDOW_SETTLE_INTERVAL_MS);
+  }
+
+  // Safety first:
+  // If Chrome is still restoring pinned tabs, do not create
+  // replacements. A later event/reconciliation can try again.
+  return false;
+}
+
+async function unpinDuplicateMatches(matches, keeperTabId) {
+  for (const duplicate of matches) {
+    if (
+      duplicate.id === keeperTabId ||
+      !duplicate.pinned
+    ) {
+      continue;
+    }
+
+    try {
+      await safelySetPinned(
+        duplicate.id,
+        false
+      );
+    } catch {
+      // The tab/window may have disappeared while Chrome was
+      // restoring. That is safe to ignore.
+    }
+  }
+}
+
 async function ensureWindow(windowId) {
   let window;
 
   try {
-    window =
-      await chrome.windows.get(windowId);
+    window = await chrome.windows.get(windowId);
   } catch {
     return;
   }
@@ -296,16 +362,28 @@ async function ensureWindow(windowId) {
     return;
   }
 
+  const settled =
+    await waitForWindowToSettle(windowId);
+
+  if (!settled) {
+    return;
+  }
+
   const sites = await getPinnedSites();
 
   let tabs;
 
   try {
-    tabs =
-      await chrome.tabs.query({
-        windowId
-      });
+    tabs = await chrome.tabs.query({
+      windowId
+    });
   } catch {
+    return;
+  }
+
+  // Do not mutate a restored window while any pinned tab still
+  // lacks a usable HTTP(S) identity.
+  if (hasUnresolvedPinnedTabs(tabs)) {
     return;
   }
 
@@ -318,7 +396,7 @@ async function ensureWindow(windowId) {
   ) {
     const site = sites[index];
 
-    let tab = tabs.find(candidate => {
+    const matches = tabs.filter(candidate => {
       if (usedTabIds.has(candidate.id)) {
         return false;
       }
@@ -328,6 +406,14 @@ async function ensureWindow(windowId) {
         site.key
       );
     });
+
+    // Prefer an already-pinned copy. This is important during
+    // Chrome session restoration: if both a pinned and ordinary
+    // copy exist, Arcify must not pin the ordinary copy too.
+    let tab =
+      matches.find(candidate => candidate.pinned) ||
+      matches[0] ||
+      null;
 
     if (!tab) {
       try {
@@ -361,7 +447,21 @@ async function ensureWindow(windowId) {
         }
       );
     } catch {
+      continue;
     }
+
+    // Arcify uses one persistent favorite per origin.
+    // If Chrome restoration somehow produced multiple pinned
+    // copies, preserve all tabs but unpin the extras.
+    const allCurrentMatches = tabs.filter(candidate =>
+      siteKey(getTabUrl(candidate)) ===
+      site.key
+    );
+
+    await unpinDuplicateMatches(
+      allCurrentMatches,
+      tab.id
+    );
   }
 }
 
@@ -505,17 +605,21 @@ chrome.windows.onCreated.addListener(
       return;
     }
 
-    enqueue(
-      () => ensureWindow(window.id)
-    );
+    setTimeout(() => {
+      enqueue(
+        () => ensureWindow(window.id)
+      );
+    }, NEW_WINDOW_RECONCILE_DELAY_MS);
   }
 );
 
 chrome.runtime.onStartup.addListener(
   () => {
-    enqueue(
-      () => ensureAllWindows()
-    );
+    setTimeout(() => {
+      enqueue(
+        () => ensureAllWindows()
+      );
+    }, STARTUP_RECONCILE_DELAY_MS);
   }
 );
 
