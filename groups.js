@@ -1,4 +1,6 @@
-const ARCIFY_GROUPS_KEY = "arcifyGroupsV1";
+const GROUPS_STORAGE_KEY = "arcifyGroupsV1";
+const NEW_WINDOW_GROUP_RESTORE_DELAY_MS = 600;
+const STARTUP_GROUP_RESTORE_DELAY_MS = 1000;
 
 let arcifyGroupQueue = Promise.resolve();
 
@@ -49,25 +51,21 @@ function groupLinkKey(url) {
 async function getSavedArcifyGroups() {
   const result =
     await chrome.storage.local.get(
-      ARCIFY_GROUPS_KEY
+      GROUPS_STORAGE_KEY
     );
 
   return Array.isArray(
-    result[ARCIFY_GROUPS_KEY]
+    result[GROUPS_STORAGE_KEY]
   )
-    ? result[ARCIFY_GROUPS_KEY]
+    ? result[GROUPS_STORAGE_KEY]
     : [];
 }
 
 async function saveArcifyGroups(groups) {
   await chrome.storage.local.set({
-    [ARCIFY_GROUPS_KEY]: groups
+    [GROUPS_STORAGE_KEY]: groups
   });
 
-  console.log(
-    "Arcify saved groups:",
-    groups
-  );
 }
 
 async function captureGroupsFromWindow(windowId) {
@@ -615,7 +613,7 @@ chrome.windows.onCreated.addListener(
             window.id
           )
       );
-    }, 600);
+    }, NEW_WINDOW_GROUP_RESTORE_DELAY_MS);
   }
 );
 
@@ -626,6 +624,6 @@ chrome.runtime.onStartup.addListener(
         () =>
           ensureArcifyGroupsInAllWindows()
       );
-    }, 1000);
+    }, STARTUP_GROUP_RESTORE_DELAY_MS);
   }
 );

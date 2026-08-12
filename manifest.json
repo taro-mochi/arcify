@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Arcify",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Arc-style persistent pinned tabs for Chrome",
   "permissions": [
     "tabs",
@@ -32,5 +32,6 @@
     "32": "icons/icon128.png",
     "48": "icons/icon128.png",
     "128": "icons/icon128.png"
-  }
+  },
+  "incognito": "not_allowed"
 }

@@ -1,6 +1,12 @@
-const STATE_VERSION = 4;
+const PIN_SCHEMA_VERSION = 4;
 const UNPIN_DELAY_MS = 700;
 const SUPPRESSION_MS = 3000;
+
+chrome.storage.local.setAccessLevel({
+  accessLevel: "TRUSTED_CONTEXTS"
+}).catch(error => {
+  console.error("Arcify could not restrict storage access:", error);
+});
 
 let queue = Promise.resolve();
 
@@ -121,16 +127,9 @@ async function savePinnedSites(sites) {
 
   await chrome.storage.local.set({
     pinnedSites: cleaned,
-    arcifyStateVersion: STATE_VERSION
+    arcifyStateVersion: PIN_SCHEMA_VERSION
   });
 
-  console.log(
-    "Arcify master pins:",
-    cleaned.map(site => ({
-      name: site.name,
-      key: site.key
-    }))
-  );
 }
 
 function suppressionKey(tabId, pinned) {
@@ -204,10 +203,6 @@ async function importPinsFromFocusedWindow() {
 
   await savePinnedSites(sites);
 
-  console.log(
-    "Arcify imported focused window:",
-    sites.map(site => site.key)
-  );
 
   return sites;
 }
@@ -233,10 +228,6 @@ async function addPinnedSite(tab) {
 
   await savePinnedSites(sites);
 
-  console.log(
-    "Arcify learned:",
-    site.key
-  );
 
   return true;
 }
@@ -265,10 +256,6 @@ async function removePinnedSite(tab) {
     )
   );
 
-  console.log(
-    "Arcify forgot:",
-    key
-  );
 
   return existing;
 }
@@ -443,10 +430,6 @@ async function confirmManualUnpin(tabId) {
     tab =
       await chrome.tabs.get(tabId);
   } catch {
-    console.log(
-      "Arcify ignored closed tab/window:",
-      tabId
-    );
 
     return;
   }
@@ -487,11 +470,6 @@ chrome.tabs.onUpdated.addListener(
         changeInfo.pinned
       )
     ) {
-      console.log(
-        "Arcify ignored its own pin change:",
-        tabId,
-        changeInfo.pinned
-      );
 
       return;
     }
@@ -551,7 +529,7 @@ chrome.runtime.onInstalled.addListener(
 
       if (
         result.arcifyStateVersion !==
-        STATE_VERSION
+        PIN_SCHEMA_VERSION
       ) {
         await importPinsFromFocusedWindow();
       }
