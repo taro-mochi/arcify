@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Arcify",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Arc-style persistent pinned tabs for Chrome",
   "permissions": [
     "tabs",
@@ -9,5 +9,13 @@
   ],
   "background": {
     "service_worker": "background.js"
+  },
+  "commands": {
+    "switch-last-tab": {
+      "suggested_key": {
+        "mac": "MacCtrl+Period"
+      },
+      "description": "Switch to last visited tab"
+    }
   }
 }

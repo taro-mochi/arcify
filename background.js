@@ -560,3 +560,113 @@ chrome.runtime.onInstalled.addListener(
     });
   }
 );
+
+// ============================================================
+// MRU TAB SWITCHING
+//
+// Control + Period internally.
+// Karabiner will later translate Control + ` -> Control + Period.
+//
+// storage.session survives service-worker sleep, but clears
+// when Chrome fully exits, which is exactly what we want for
+// tab history.
+// ============================================================
+
+function mruStorageKey(windowId) {
+  return `arcify_mru_${windowId}`;
+}
+
+async function recordTabActivation(activeInfo) {
+  const key = mruStorageKey(activeInfo.windowId);
+
+  const result =
+    await chrome.storage.session.get(key);
+
+  const state = result[key] || {
+    currentTabId: null,
+    previousTabId: null
+  };
+
+  if (state.currentTabId === activeInfo.tabId) {
+    return;
+  }
+
+  const newState = {
+    previousTabId: state.currentTabId,
+    currentTabId: activeInfo.tabId
+  };
+
+  await chrome.storage.session.set({
+    [key]: newState
+  });
+}
+
+async function switchToLastTab() {
+  const activeTabs = await chrome.tabs.query({
+    active: true,
+    lastFocusedWindow: true
+  });
+
+  const currentTab = activeTabs[0];
+
+  if (!currentTab) {
+    return;
+  }
+
+  const key = mruStorageKey(currentTab.windowId);
+
+  const result =
+    await chrome.storage.session.get(key);
+
+  const state = result[key];
+
+  if (
+    !state ||
+    !state.previousTabId
+  ) {
+    return;
+  }
+
+  let previousTab;
+
+  try {
+    previousTab =
+      await chrome.tabs.get(
+        state.previousTabId
+      );
+  } catch {
+    return;
+  }
+
+  if (
+    previousTab.windowId !==
+    currentTab.windowId
+  ) {
+    return;
+  }
+
+  await chrome.tabs.update(
+    previousTab.id,
+    {
+      active: true
+    }
+  );
+}
+
+chrome.tabs.onActivated.addListener(
+  activeInfo => {
+    recordTabActivation(activeInfo)
+      .catch(console.error);
+  }
+);
+
+chrome.commands.onCommand.addListener(
+  command => {
+    if (command !== "switch-last-tab") {
+      return;
+    }
+
+    switchToLastTab()
+      .catch(console.error);
+  }
+);
