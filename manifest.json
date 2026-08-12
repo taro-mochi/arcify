@@ -1,11 +1,12 @@
 {
   "manifest_version": 3,
   "name": "Arcify",
-  "version": "0.5.0",
+  "version": "0.6.1",
   "description": "Arc-style persistent pinned tabs for Chrome",
   "permissions": [
     "tabs",
-    "storage"
+    "storage",
+    "tabGroups"
   ],
   "background": {
     "service_worker": "background.js"
@@ -17,5 +18,19 @@
       },
       "description": "Switch to last visited tab"
     }
+  },
+  "action": {
+    "default_title": "Arcify",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon128.png",
+      "32": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon128.png",
+    "32": "icons/icon128.png",
+    "48": "icons/icon128.png",
+    "128": "icons/icon128.png"
   }
 }

@@ -670,3 +670,5 @@ chrome.commands.onCommand.addListener(
       .catch(console.error);
   }
 );
+
+importScripts("groups.js");
