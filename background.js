@@ -2,10 +2,11 @@ const PIN_SCHEMA_VERSION = 4;
 const UNPIN_DELAY_MS = 700;
 const SUPPRESSION_MS = 3000;
 
-const WINDOW_SETTLE_INTERVAL_MS = 250;
-const WINDOW_SETTLE_MAX_ATTEMPTS = 24;
-const NEW_WINDOW_RECONCILE_DELAY_MS = 300;
-const STARTUP_RECONCILE_DELAY_MS = 2000;
+const NEW_WINDOW_POPULATE_DELAY_MS = 700;
+const BROWSER_STARTUP_GUARD_MS = 5000;
+const DEDUPE_DELAY_MS = 250;
+
+const WINDOW_POPULATION_SESSION_KEY = "arcifyWindowPopulationSession";
 
 chrome.storage.local.setAccessLevel({
   accessLevel: "TRUSTED_CONTEXTS"
@@ -288,65 +289,45 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function hasUnresolvedPinnedTabs(tabs) {
-  return tabs.some(tab => {
-    if (!tab.pinned) {
-      return false;
-    }
+async function initializeWindowPopulationSession() {
+  const result = await chrome.storage.session.get(
+    WINDOW_POPULATION_SESSION_KEY
+  );
 
-    return siteKey(getTabUrl(tab)) === null;
+  if (result[WINDOW_POPULATION_SESSION_KEY]) {
+    return;
+  }
+
+  await chrome.storage.session.set({
+    [WINDOW_POPULATION_SESSION_KEY]: {
+      startupGuardUntil: Date.now() + BROWSER_STARTUP_GUARD_MS
+    }
   });
 }
 
-async function waitForWindowToSettle(windowId) {
-  for (
-    let attempt = 0;
-    attempt < WINDOW_SETTLE_MAX_ATTEMPTS;
-    attempt++
-  ) {
-    let tabs;
+async function isWindowPopulationAllowed() {
+  const result = await chrome.storage.session.get(
+    WINDOW_POPULATION_SESSION_KEY
+  );
 
-    try {
-      tabs = await chrome.tabs.query({ windowId });
-    } catch {
-      return false;
-    }
+  const session = result[WINDOW_POPULATION_SESSION_KEY];
 
-    if (!hasUnresolvedPinnedTabs(tabs)) {
-      return true;
-    }
-
-    await sleep(WINDOW_SETTLE_INTERVAL_MS);
+  if (!session) {
+    return false;
   }
 
-  // Safety first:
-  // If Chrome is still restoring pinned tabs, do not create
-  // replacements. A later event/reconciliation can try again.
-  return false;
+  return Date.now() >= session.startupGuardUntil;
 }
 
-async function unpinDuplicateMatches(matches, keeperTabId) {
-  for (const duplicate of matches) {
-    if (
-      duplicate.id === keeperTabId ||
-      !duplicate.pinned
-    ) {
-      continue;
+async function allowWindowPopulationNow() {
+  await chrome.storage.session.set({
+    [WINDOW_POPULATION_SESSION_KEY]: {
+      startupGuardUntil: 0
     }
-
-    try {
-      await safelySetPinned(
-        duplicate.id,
-        false
-      );
-    } catch {
-      // The tab/window may have disappeared while Chrome was
-      // restoring. That is safe to ignore.
-    }
-  }
+  });
 }
 
-async function ensureWindow(windowId) {
+async function dedupePinnedTabsInWindow(windowId) {
   let window;
 
   try {
@@ -362,14 +343,94 @@ async function ensureWindow(windowId) {
     return;
   }
 
-  const settled =
-    await waitForWindowToSettle(windowId);
+  const sites = await getPinnedSites();
+  const savedKeys = new Set(
+    sites.map(site => site.key)
+  );
 
-  if (!settled) {
+  let tabs;
+
+  try {
+    tabs = await chrome.tabs.query({
+      windowId,
+      pinned: true
+    });
+  } catch {
     return;
   }
 
-  const sites = await getPinnedSites();
+  const tabsByKey = new Map();
+
+  for (const tab of tabs) {
+    const key = siteKey(getTabUrl(tab));
+
+    if (!key || !savedKeys.has(key)) {
+      continue;
+    }
+
+    if (!tabsByKey.has(key)) {
+      tabsByKey.set(key, []);
+    }
+
+    tabsByKey.get(key).push(tab);
+  }
+
+  for (const matches of tabsByKey.values()) {
+    if (matches.length <= 1) {
+      continue;
+    }
+
+    matches.sort(
+      (a, b) => a.index - b.index
+    );
+
+    const [, ...duplicates] = matches;
+
+    for (const duplicate of duplicates) {
+      try {
+        await safelySetPinned(
+          duplicate.id,
+          false
+        );
+      } catch {
+      }
+    }
+  }
+}
+
+async function dedupeAllWindows() {
+  const windows = await chrome.windows.getAll({
+    windowTypes: ["normal"]
+  });
+
+  for (const window of windows) {
+    if (!window.incognito) {
+      await dedupePinnedTabsInWindow(
+        window.id
+      );
+    }
+  }
+}
+
+async function ensureSiteInWindow(
+  windowId,
+  site,
+  index
+) {
+  let window;
+
+  try {
+    window = await chrome.windows.get(windowId);
+  } catch {
+    return;
+  }
+
+  if (
+    window.type !== "normal" ||
+    window.incognito
+  ) {
+    return;
+  }
 
   let tabs;
 
@@ -381,100 +442,121 @@ async function ensureWindow(windowId) {
     return;
   }
 
-  // Do not mutate a restored window while any pinned tab still
-  // lacks a usable HTTP(S) identity.
-  if (hasUnresolvedPinnedTabs(tabs)) {
+  const matches = tabs.filter(tab =>
+    siteKey(getTabUrl(tab)) === site.key
+  );
+
+  let tab =
+    matches.find(candidate => candidate.pinned) ||
+    matches[0] ||
+    null;
+
+  if (!tab) {
+    try {
+      tab = await chrome.tabs.create({
+        windowId,
+        url: site.url,
+        active: false,
+        index
+      });
+    } catch {
+      return;
+    }
+  }
+
+  try {
+    if (!tab.pinned) {
+      tab = await safelySetPinned(
+        tab.id,
+        true
+      );
+    }
+
+    await chrome.tabs.move(
+      tab.id,
+      { index }
+    );
+  } catch {
     return;
   }
 
-  const usedTabIds = new Set();
+  await dedupePinnedTabsInWindow(windowId);
+}
+
+async function populateNewWindow(windowId) {
+  await initializeWindowPopulationSession();
+  await sleep(NEW_WINDOW_POPULATE_DELAY_MS);
+
+  if (!await isWindowPopulationAllowed()) {
+    return;
+  }
+
+  let window;
+  let pinnedTabs;
+
+  try {
+    window = await chrome.windows.get(windowId);
+
+    if (
+      window.type !== "normal" ||
+      window.incognito
+    ) {
+      return;
+    }
+
+    pinnedTabs = await chrome.tabs.query({
+      windowId,
+      pinned: true
+    });
+  } catch {
+    return;
+  }
+
+  // If Chrome already has any pinned tabs, this is an
+  // existing/restored window. Never create another set.
+  if (pinnedTabs.length > 0) {
+    await dedupePinnedTabsInWindow(windowId);
+    return;
+  }
+
+  // Tab groups may already have added ordinary tabs.
+  // That does not matter: zero pinned tabs means this
+  // window still needs its Arcify favorites.
+  const sites = await getPinnedSites();
 
   for (
     let index = 0;
     index < sites.length;
     index++
   ) {
-    const site = sites[index];
-
-    const matches = tabs.filter(candidate => {
-      if (usedTabIds.has(candidate.id)) {
-        return false;
-      }
-
-      return (
-        siteKey(getTabUrl(candidate)) ===
-        site.key
-      );
-    });
-
-    // Prefer an already-pinned copy. This is important during
-    // Chrome session restoration: if both a pinned and ordinary
-    // copy exist, Arcify must not pin the ordinary copy too.
-    let tab =
-      matches.find(candidate => candidate.pinned) ||
-      matches[0] ||
-      null;
-
-    if (!tab) {
-      try {
-        tab = await chrome.tabs.create({
-          windowId,
-          url: site.url,
-          active: false,
-          index
-        });
-
-        tabs.push(tab);
-      } catch {
-        continue;
-      }
-    }
-
-    usedTabIds.add(tab.id);
-
-    try {
-      if (!tab.pinned) {
-        tab = await safelySetPinned(
-          tab.id,
-          true
-        );
-      }
-
-      await chrome.tabs.move(
-        tab.id,
-        {
-          index
-        }
-      );
-    } catch {
-      continue;
-    }
-
-    // Arcify uses one persistent favorite per origin.
-    // If Chrome restoration somehow produced multiple pinned
-    // copies, preserve all tabs but unpin the extras.
-    const allCurrentMatches = tabs.filter(candidate =>
-      siteKey(getTabUrl(candidate)) ===
-      site.key
-    );
-
-    await unpinDuplicateMatches(
-      allCurrentMatches,
-      tab.id
+    await ensureSiteInWindow(
+      windowId,
+      sites[index],
+      index
     );
   }
 }
 
-async function ensureAllWindows() {
-  const windows =
-    await chrome.windows.getAll({
-      windowTypes: ["normal"]
-    });
+async function propagateNewFavorite(site) {
+  const windows = await chrome.windows.getAll({
+    windowTypes: ["normal"]
+  });
+
+  const sites = await getPinnedSites();
+  const index = sites.findIndex(
+    saved => saved.key === site.key
+  );
 
   for (const window of windows) {
-    if (!window.incognito) {
-      await ensureWindow(window.id);
+    if (window.incognito) {
+      continue;
     }
+
+    await ensureSiteInWindow(
+      window.id,
+      site,
+      Math.max(index, 0)
+    );
   }
 }
 
@@ -580,7 +662,15 @@ chrome.tabs.onUpdated.addListener(
           await addPinnedSite(tab);
 
         if (added) {
-          await ensureAllWindows();
+          const site = makeSite(tab);
+
+          if (site) {
+            await propagateNewFavorite(site);
+          }
+        } else {
+          await dedupePinnedTabsInWindow(
+            tab.windowId
+          );
         }
       });
 
@@ -605,27 +695,96 @@ chrome.windows.onCreated.addListener(
       return;
     }
 
-    setTimeout(() => {
-      enqueue(
-        () => ensureWindow(window.id)
+    populateNewWindow(
+      window.id
+    ).catch(error => {
+      console.error(
+        "Arcify could not initialize new window:",
+        error
       );
-    }, NEW_WINDOW_RECONCILE_DELAY_MS);
+    });
   }
 );
 
 chrome.runtime.onStartup.addListener(
   () => {
-    setTimeout(() => {
-      enqueue(
-        () => ensureAllWindows()
-      );
-    }, STARTUP_RECONCILE_DELAY_MS);
+    enqueue(async () => {
+      await initializeWindowPopulationSession();
+      await dedupeAllWindows();
+    });
   }
 );
 
+async function restoreSavedPinsInFocusedWindow() {
+  let window;
+
+  try {
+    window = await chrome.windows.getLastFocused();
+  } catch {
+    return;
+  }
+
+  if (
+    !window ||
+    window.type !== "normal" ||
+    window.incognito
+  ) {
+    return;
+  }
+
+  let currentPinnedTabs;
+
+  try {
+    currentPinnedTabs = await chrome.tabs.query({
+      windowId: window.id,
+      pinned: true
+    });
+  } catch {
+    return;
+  }
+
+  // Extension reload must be conservative.
+  //
+  // Existing pinned tabs survive an extension reload. If this
+  // window already has pins, do not attempt to "repair" it:
+  // redirects and partially loaded apps can make an existing
+  // tab temporarily look different from its saved URL and
+  // cause a duplicate to be created.
+  //
+  // We only reconstruct favorites when the window has no
+  // pinned tabs at all.
+  if (currentPinnedTabs.length > 0) {
+    await dedupePinnedTabsInWindow(
+      window.id
+    );
+
+    return;
+  }
+
+  const sites = await getPinnedSites();
+
+  for (
+    let index = 0;
+    index < sites.length;
+    index++
+  ) {
+    await ensureSiteInWindow(
+      window.id,
+      sites[index],
+      index
+    );
+  }
+
+  await dedupePinnedTabsInWindow(
+    window.id
+  );
+}
+
 chrome.runtime.onInstalled.addListener(
-  () => {
+  details => {
     enqueue(async () => {
+      await allowWindowPopulationNow();
+
       const result =
         await chrome.storage.local.get(
           "arcifyStateVersion"
@@ -638,7 +797,21 @@ chrome.runtime.onInstalled.addListener(
         await importPinsFromFocusedWindow();
       }
 
-      await ensureAllWindows();
+      // Reloading an unpacked extension is reported by Chrome
+      // as an extension update. This is an explicit user/dev
+      // action, so restoring saved pins in the focused window
+      // is safe.
+      if (
+        details.reason === "install" ||
+        details.reason === "update"
+      ) {
+        await restoreSavedPinsInFocusedWindow();
+        return;
+      }
+
+      // Chrome/browser lifecycle events must never create
+      // missing favorites inside restored windows.
+      await dedupeAllWindows();
     });
   }
 );
@@ -739,6 +912,34 @@ chrome.tabs.onActivated.addListener(
   activeInfo => {
     recordTabActivation(activeInfo)
       .catch(console.error);
+
+    setTimeout(() => {
+      enqueue(
+        () =>
+          dedupePinnedTabsInWindow(
+            activeInfo.windowId
+          )
+      );
+    }, DEDUPE_DELAY_MS);
+  }
+);
+
+
+chrome.windows.onFocusChanged.addListener(
+  windowId => {
+    if (
+      windowId ===
+      chrome.windows.WINDOW_ID_NONE
+    ) {
+      return;
+    }
+
+    enqueue(
+      () =>
+        dedupePinnedTabsInWindow(
+          windowId
+        )
+    );
   }
 );
 
