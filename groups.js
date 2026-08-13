@@ -1,629 +1,258 @@
-const GROUPS_STORAGE_KEY = "arcifyGroupsV1";
-const NEW_WINDOW_GROUP_RESTORE_DELAY_MS = 600;
-const STARTUP_GROUP_RESTORE_DELAY_MS = 1000;
+(() => {
+  "use strict";
 
-let arcifyGroupQueue = Promise.resolve();
+  const TAB_GROUP_NONE = chrome.tabGroups.TAB_GROUP_ID_NONE ?? -1;
 
-function queueGroupOperation(fn) {
-  arcifyGroupQueue = arcifyGroupQueue
-    .then(fn)
-    .catch(error => {
-      console.error("Arcify Groups:", error);
-    });
+  async function getNormalWindow(windowId) {
+    try {
+      const window = await chrome.windows.get(windowId);
 
-  return arcifyGroupQueue;
-}
+      if (window.type !== "normal" || window.incognito) {
+        return null;
+      }
 
-function groupTabUrl(tab) {
-  return tab?.url || tab?.pendingUrl || null;
-}
-
-function isGroupUrlAllowed(url) {
-  return (
-    typeof url === "string" &&
-    (
-      url.startsWith("https://") ||
-      url.startsWith("http://")
-    )
-  );
-}
-
-function groupLinkKey(url) {
-  if (!isGroupUrlAllowed(url)) {
-    return null;
+      return window;
+    } catch {
+      return null;
+    }
   }
 
-  try {
-    const parsed = new URL(url);
-
-    let path = parsed.pathname || "/";
-
-    if (path.length > 1) {
-      path = path.replace(/\/+$/, "");
+  async function capture(windowId) {
+    if (!Number.isInteger(windowId) || !(await getNormalWindow(windowId))) {
+      throw new Error("Arcify can only save groups from a normal Chrome window.");
     }
 
-    return `${parsed.origin}${path}${parsed.search}`;
-  } catch {
-    return null;
-  }
-}
+    const [tabs, nativeGroups] = await Promise.all([
+      chrome.tabs.query({ windowId }),
+      chrome.tabGroups.query({ windowId })
+    ]);
 
-async function getSavedArcifyGroups() {
-  const result =
-    await chrome.storage.local.get(
-      GROUPS_STORAGE_KEY
-    );
+    const titles = nativeGroups.map(group => (group.title || "").trim());
 
-  return Array.isArray(
-    result[GROUPS_STORAGE_KEY]
-  )
-    ? result[GROUPS_STORAGE_KEY]
-    : [];
-}
+    if (titles.some(title => !title)) {
+      throw new Error("Give every tab group a name before saving the workspace.");
+    }
 
-async function saveArcifyGroups(groups) {
-  await chrome.storage.local.set({
-    [GROUPS_STORAGE_KEY]: groups
-  });
+    if (new Set(titles).size !== titles.length) {
+      throw new Error("Give every saved tab group a unique name.");
+    }
 
-}
+    const captured = [];
 
-async function captureGroupsFromWindow(windowId) {
-  const window =
-    await chrome.windows.get(windowId);
+    for (const group of nativeGroups.sort((a, b) => a.id - b.id)) {
+      const links = [];
+      const seen = new Set();
+      const members = tabs
+        .filter(tab => tab.groupId === group.id && !tab.pinned)
+        .sort((a, b) => a.index - b.index);
 
-  if (
-    window.type !== "normal" ||
-    window.incognito
-  ) {
-    throw new Error(
-      "Arcify can only save groups from a normal Chrome window."
-    );
-  }
+      for (const tab of members) {
+        const url = ArcifyStorage.sanitizeUrl(tab.url || tab.pendingUrl);
+        const key = ArcifyStorage.linkKey(url);
 
-  const tabs =
-    await chrome.tabs.query({
-      windowId
-    });
+        if (!url || !key || seen.has(key)) {
+          continue;
+        }
 
-  const nativeGroups =
-    await chrome.tabGroups.query({
-      windowId
-    });
+        seen.add(key);
+        links.push({ url, key });
+      }
 
-  if (nativeGroups.length === 0) {
-    await saveArcifyGroups([]);
-
-    return {
-      ok: true,
-      groups: []
-    };
-  }
-
-  const titles =
-    nativeGroups.map(group =>
-      (group.title || "").trim()
-    );
-
-  if (titles.some(title => !title)) {
-    throw new Error(
-      "Please give every tab group a name before saving it."
-    );
-  }
-
-  const duplicateTitles =
-    titles.filter(
-      (title, index) =>
-        titles.indexOf(title) !== index
-    );
-
-  if (duplicateTitles.length > 0) {
-    throw new Error(
-      "Please give every Arcify group a unique name."
-    );
-  }
-
-  const captured = [];
-
-  for (const group of nativeGroups) {
-    const members =
-      tabs
-        .filter(
-          tab =>
-            tab.groupId === group.id &&
-            !tab.pinned
-        )
-        .sort(
-          (a, b) =>
-            a.index - b.index
-        );
-
-    const links = [];
-    const seen = new Set();
-
-    for (const tab of members) {
-      const url = groupTabUrl(tab);
-
-      if (!isGroupUrlAllowed(url)) {
+      if (links.length === 0) {
         continue;
       }
 
-      const key =
-        groupLinkKey(url);
-
-      if (!key || seen.has(key)) {
-        continue;
-      }
-
-      seen.add(key);
-
-      links.push({
-        name:
-          tab.title ||
-          key,
-
-        url,
-        key
+      captured.push({
+        title: group.title.trim(),
+        color: ArcifyStorage.GROUP_COLORS.has(group.color) ? group.color : "grey",
+        collapsed: group.collapsed,
+        links,
+        firstIndex: members[0]?.index ?? Number.MAX_SAFE_INTEGER
       });
     }
 
-    if (links.length === 0) {
-      continue;
-    }
+    captured.sort((a, b) => a.firstIndex - b.firstIndex);
 
-    captured.push({
-      title: group.title.trim(),
-      color: group.color,
-      collapsed: group.collapsed,
-      links,
-      firstIndex:
-        members.length
-          ? members[0].index
-          : Number.MAX_SAFE_INTEGER
-    });
+    return captured.map(({ firstIndex: _firstIndex, ...group }) => group);
   }
 
-  captured.sort(
-    (a, b) =>
-      a.firstIndex - b.firstIndex
-  );
+  async function groupFingerprint(windowId, group) {
+    try {
+      const tabs = await chrome.tabs.query({
+        windowId,
+        groupId: group.id
+      });
 
-  const cleaned =
-    captured.map(group => ({
-      title: group.title,
-      color: group.color,
-      collapsed: group.collapsed,
-      links: group.links
-    }));
+      return tabs
+        .filter(tab => !tab.pinned)
+        .sort((a, b) => a.index - b.index)
+        .map(tab => ArcifyStorage.linkKey(tab.url || tab.pendingUrl))
+        .filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
 
-  await saveArcifyGroups(cleaned);
+  function sameOrderedKeys(left, right) {
+    return (
+      left.length === right.length &&
+      left.every((value, index) => value === right[index])
+    );
+  }
 
-  return {
-    ok: true,
-    groups: cleaned
-  };
-}
+  async function findExistingExactGroup(windowId, savedGroup) {
+    let candidates;
 
-async function findOrCreateTabForGroup(
-  windowId,
-  savedLink,
-  targetGroupId,
-  usedTabIds
-) {
-  const tabs =
-    await chrome.tabs.query({
-      windowId
-    });
+    try {
+      candidates = await chrome.tabGroups.query({
+        windowId,
+        title: savedGroup.title
+      });
+    } catch {
+      return null;
+    }
 
-  let candidate =
-    tabs.find(tab => {
-      if (
-        usedTabIds.has(tab.id) ||
-        tab.pinned
-      ) {
-        return false;
+    const wantedKeys = savedGroup.links.map(link => link.key);
+
+    for (const candidate of candidates) {
+      if (candidate.windowId !== windowId || candidate.title !== savedGroup.title) {
+        continue;
       }
 
-      if (
-        targetGroupId !== null &&
-        tab.groupId !== targetGroupId
-      ) {
-        return false;
+      const existingKeys = await groupFingerprint(windowId, candidate);
+
+      if (sameOrderedKeys(existingKeys, wantedKeys)) {
+        return candidate;
       }
+    }
 
-      return (
-        groupLinkKey(
-          groupTabUrl(tab)
-        ) ===
-        savedLink.key
-      );
-    });
+    return null;
+  }
 
-  if (!candidate) {
-    candidate =
+  async function findReusableTab(windowId, link, usedTabIds) {
+    let tabs;
+
+    try {
+      tabs = await chrome.tabs.query({ windowId });
+    } catch {
+      return null;
+    }
+
+    return (
       tabs.find(tab => {
         if (
           usedTabIds.has(tab.id) ||
-          tab.pinned
+          tab.pinned ||
+          tab.groupId !== TAB_GROUP_NONE
         ) {
           return false;
         }
 
-        return (
-          groupLinkKey(
-            groupTabUrl(tab)
-          ) ===
-          savedLink.key
-        );
-      });
-  }
-
-  if (candidate) {
-    usedTabIds.add(
-      candidate.id
+        return ArcifyStorage.linkKey(tab.url || tab.pendingUrl) === link.key;
+      }) || null
     );
-
-    return {
-      tab: candidate,
-      created: false
-    };
   }
 
-  const created =
-    await chrome.tabs.create({
-      windowId,
-      url: savedLink.url,
-      active: false
-    });
-
-  usedTabIds.add(
-    created.id
-  );
-
-  return {
-    tab: created,
-    created: true
-  };
-}
-
-async function ensureOneArcifyGroup(
-  windowId,
-  savedGroup
-) {
-  const nativeGroups =
-    await chrome.tabGroups.query({
-      windowId
-    });
-
-  let targetGroup =
-    nativeGroups.find(
-      group =>
-        group.title ===
-        savedGroup.title
-    ) || null;
-
-  const usedTabIds =
-    new Set();
-
-  const tabIds = [];
-
-  for (
-    const link of savedGroup.links
-  ) {
-    const result =
-      await findOrCreateTabForGroup(
-        windowId,
-        link,
-        targetGroup
-          ? targetGroup.id
-          : null,
-        usedTabIds
-      );
-
-    tabIds.push(
-      result.tab.id
-    );
-
-  }
-
-  if (tabIds.length === 0) {
-    return null;
-  }
-
-  let groupId;
-
-  if (targetGroup) {
-    groupId =
-      targetGroup.id;
-
-    const tabs =
-      await chrome.tabs.query({
-        windowId
-      });
-
-    const needsGrouping =
-      tabIds.filter(tabId => {
-        const tab =
-          tabs.find(
-            candidate =>
-              candidate.id === tabId
-          );
-
-        return (
-          tab &&
-          tab.groupId !== groupId
-        );
-      });
-
-    if (needsGrouping.length) {
-      await chrome.tabs.group({
-        groupId,
-        tabIds: needsGrouping
-      });
+  async function restoreOne(windowId, savedGroup) {
+    if (!(await getNormalWindow(windowId))) {
+      return false;
     }
-  } else {
-    groupId =
-      await chrome.tabs.group({
+
+    const existingGroup = await findExistingExactGroup(windowId, savedGroup);
+
+    if (existingGroup) {
+      try {
+        await chrome.tabGroups.update(existingGroup.id, {
+          title: savedGroup.title,
+          color: savedGroup.color,
+          collapsed: savedGroup.collapsed
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    const tabIds = [];
+    const usedTabIds = new Set();
+
+    for (const link of savedGroup.links) {
+      if (!(await getNormalWindow(windowId))) {
+        return false;
+      }
+
+      let tab = await findReusableTab(windowId, link, usedTabIds);
+
+      if (!tab) {
+        try {
+          tab = await chrome.tabs.create({
+            windowId,
+            url: link.url,
+            active: false
+          });
+        } catch {
+          return false;
+        }
+      }
+
+      if (tab.windowId !== windowId || tab.pinned) {
+        return false;
+      }
+
+      usedTabIds.add(tab.id);
+      tabIds.push(tab.id);
+    }
+
+    if (tabIds.length === 0 || !(await getNormalWindow(windowId))) {
+      return false;
+    }
+
+    try {
+      const groupId = await chrome.tabs.group({
         tabIds,
-        createProperties: {
-          windowId
-        }
-      });
-  }
-
-  await chrome.tabGroups.update(
-    groupId,
-    {
-      title: savedGroup.title,
-      color: savedGroup.color,
-      collapsed:
-        savedGroup.collapsed
-    }
-  );
-
-  return groupId;
-}
-
-async function arrangeArcifyGroups(
-  windowId,
-  savedGroups
-) {
-  const tabs =
-    await chrome.tabs.query({
-      windowId
-    });
-
-  const pinnedCount =
-    tabs.filter(
-      tab => tab.pinned
-    ).length;
-
-  let targetIndex =
-    pinnedCount;
-
-  for (
-    const savedGroup of savedGroups
-  ) {
-    const groups =
-      await chrome.tabGroups.query({
-        windowId
+        createProperties: { windowId }
       });
 
-    const nativeGroup =
-      groups.find(
-        group =>
-          group.title ===
-          savedGroup.title
-      );
+      const group = await chrome.tabGroups.get(groupId);
 
-    if (!nativeGroup) {
-      continue;
-    }
+      if (group.windowId !== windowId) {
+        return false;
+      }
 
-    try {
-      await chrome.tabGroups.move(
-        nativeGroup.id,
-        {
-          index: targetIndex
-        }
-      );
+      await chrome.tabGroups.update(groupId, {
+        title: savedGroup.title,
+        color: savedGroup.color,
+        collapsed: savedGroup.collapsed
+      });
+
+      return true;
     } catch {
-    }
-
-    const members =
-      await chrome.tabs.query({
-        windowId,
-        groupId:
-          nativeGroup.id
-      });
-
-    targetIndex +=
-      Math.max(
-        members.length,
-        1
-      );
-  }
-}
-
-async function ensureArcifyGroupsInWindow(
-  windowId
-) {
-  let window;
-
-  try {
-    window =
-      await chrome.windows.get(
-        windowId
-      );
-  } catch {
-    return;
-  }
-
-  if (
-    window.type !== "normal" ||
-    window.incognito
-  ) {
-    return;
-  }
-
-  const savedGroups =
-    await getSavedArcifyGroups();
-
-  if (!savedGroups.length) {
-    return;
-  }
-
-  for (
-    const savedGroup of savedGroups
-  ) {
-    try {
-      await ensureOneArcifyGroup(
-        windowId,
-        savedGroup
-      );
-    } catch (error) {
-      console.error(
-        `Arcify could not restore group ${savedGroup.title}:`,
-        error
-      );
+      return false;
     }
   }
 
-  await arrangeArcifyGroups(
-    windowId,
-    savedGroups
-  );
-}
-
-async function ensureArcifyGroupsInAllWindows() {
-  const windows =
-    await chrome.windows.getAll({
-      windowTypes: ["normal"]
-    });
-
-  for (const window of windows) {
-    if (!window.incognito) {
-      await ensureArcifyGroupsInWindow(
-        window.id
-      );
+  async function restore(windowId, groups) {
+    if (!Number.isInteger(windowId) || !(await getNormalWindow(windowId))) {
+      return { restored: 0, failed: 0 };
     }
+
+    const normalized = ArcifyStorage.normalizeGroups(groups);
+    let restored = 0;
+    let failed = 0;
+
+    for (const group of normalized) {
+      if (await restoreOne(windowId, group)) {
+        restored += 1;
+      } else {
+        failed += 1;
+      }
+    }
+
+    return { restored, failed };
   }
-}
 
-chrome.runtime.onMessage.addListener(
-  (
-    message,
-    sender,
-    sendResponse
-  ) => {
-    if (
-      !message ||
-      typeof message.type !==
-        "string"
-    ) {
-      return;
-    }
-
-    if (
-      message.type ===
-      "ARCIFY_SAVE_GROUPS"
-    ) {
-      queueGroupOperation(
-        async () => {
-          const result =
-            await captureGroupsFromWindow(
-              message.windowId
-            );
-
-          await ensureArcifyGroupsInAllWindows();
-
-          return result;
-        }
-      )
-        .then(sendResponse)
-        .catch(error => {
-          sendResponse({
-            ok: false,
-            error: error.message
-          });
-        });
-
-      return true;
-    }
-
-    if (
-      message.type ===
-      "ARCIFY_APPLY_GROUPS"
-    ) {
-      queueGroupOperation(
-        async () => {
-          await ensureArcifyGroupsInAllWindows();
-
-          return {
-            ok: true
-          };
-        }
-      )
-        .then(sendResponse)
-        .catch(error => {
-          sendResponse({
-            ok: false,
-            error: error.message
-          });
-        });
-
-      return true;
-    }
-
-    if (
-      message.type ===
-      "ARCIFY_CLEAR_GROUPS"
-    ) {
-      saveArcifyGroups([])
-        .then(() => {
-          sendResponse({
-            ok: true
-          });
-        })
-        .catch(error => {
-          sendResponse({
-            ok: false,
-            error: error.message
-          });
-        });
-
-      return true;
-    }
-  }
-);
-
-chrome.windows.onCreated.addListener(
-  window => {
-    if (
-      window.type !== "normal" ||
-      window.incognito
-    ) {
-      return;
-    }
-
-    setTimeout(() => {
-      queueGroupOperation(
-        () =>
-          ensureArcifyGroupsInWindow(
-            window.id
-          )
-      );
-    }, NEW_WINDOW_GROUP_RESTORE_DELAY_MS);
-  }
-);
-
-chrome.runtime.onStartup.addListener(
-  () => {
-    setTimeout(() => {
-      queueGroupOperation(
-        () =>
-          ensureArcifyGroupsInAllWindows()
-      );
-    }, STARTUP_GROUP_RESTORE_DELAY_MS);
-  }
-);
+  globalThis.ArcifyGroups = Object.freeze({
+    capture,
+    restore
+  });
+})();

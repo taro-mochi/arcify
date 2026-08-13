@@ -1,3 +1,20 @@
+.DS_Store
 *.backup
 *.v*-backup
-.DS_Store
+*.pre-v*-backup
+*~
+*.swp
+*.log
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+chrome-profile/
+chrome-user-data/
+user-data-dir/
+Local Extension Settings/
+Session Storage/
+IndexedDB/

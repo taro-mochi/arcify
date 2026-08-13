@@ -1,147 +1,159 @@
-const GROUPS_STORAGE_KEY = "arcifyGroupsV1";
+"use strict";
 
-const groupsEl = document.getElementById("groups");
+const CONFIG_KEY = "arcifyConfigV2";
 const statusEl = document.getElementById("status");
+const groupsEl = document.getElementById("groups");
+const favoriteCountEl = document.getElementById("favorite-count");
+const groupCountEl = document.getElementById("group-count");
+const buttons = [...document.querySelectorAll("button")];
 
-function setStatus(text, isError = false) {
-  statusEl.textContent = text;
-  statusEl.className = isError ? "danger" : "";
-}
-
-async function sendMessage(message) {
-  try {
-    return await chrome.runtime.sendMessage(message);
-  } catch (error) {
-    return {
-      ok: false,
-      error: error.message
-    };
+function setBusy(isBusy) {
+  for (const button of buttons) {
+    button.disabled = isBusy;
   }
 }
 
-async function renderGroups() {
-  const result = await chrome.storage.local.get(
-    GROUPS_STORAGE_KEY
-  );
+function setStatus(message = "", isError = false) {
+  statusEl.textContent = message;
+  statusEl.className = isError ? "error" : "";
+}
 
-  const groups = Array.isArray(
-    result[GROUPS_STORAGE_KEY]
-  )
-    ? result[GROUPS_STORAGE_KEY]
-    : [];
+async function currentWindowId() {
+  const [tab] = await chrome.tabs.query({
+    active: true,
+    currentWindow: true
+  });
 
+  return Number.isInteger(tab?.windowId) ? tab.windowId : null;
+}
+
+async function send(type, extra = {}) {
+  try {
+    const response = await chrome.runtime.sendMessage({ type, ...extra });
+
+    if (!response?.ok) {
+      throw new Error(response?.error || "Arcify could not complete the request.");
+    }
+
+    return response;
+  } catch (error) {
+    throw new Error(error instanceof Error ? error.message : "Arcify could not complete the request.");
+  }
+}
+
+async function render() {
+  const [{ [CONFIG_KEY]: config }, status] = await Promise.all([
+    chrome.storage.local.get(CONFIG_KEY),
+    send("ARCIFY_GET_STATUS")
+  ]);
+
+  favoriteCountEl.textContent = String(status.favorites ?? 0);
+  groupCountEl.textContent = String(status.groups ?? 0);
   groupsEl.replaceChildren();
 
-  if (!groups.length) {
-    const empty = document.createElement("div");
-    empty.className = "count";
-    empty.textContent =
-      "No persistent groups saved yet.";
+  const groups = Array.isArray(config?.groups) ? config.groups : [];
 
+  if (groups.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "No groups saved.";
     groupsEl.appendChild(empty);
     return;
   }
 
   for (const group of groups) {
     const row = document.createElement("div");
-    row.className = "group";
+    row.className = "group-row";
 
-    const title = document.createElement("strong");
-    title.textContent = group.title;
+    const title = document.createElement("span");
+    title.textContent = String(group.title || "Untitled");
 
     const count = document.createElement("span");
-    count.className = "count";
-    count.textContent =
-      ` ${group.links.length} links`;
+    count.textContent = `${Array.isArray(group.links) ? group.links.length : 0} links`;
 
     row.append(title, count);
     groupsEl.appendChild(row);
   }
 }
 
-document
-  .getElementById("save")
-  .addEventListener("click", async () => {
-    setStatus("Saving...");
+async function run(action, successMessage) {
+  setBusy(true);
+  setStatus("Working…");
 
-    const tabs = await chrome.tabs.query({
-      active: true,
-      currentWindow: true
-    });
+  try {
+    await action();
+    await render();
+    setStatus(successMessage);
+  } catch (error) {
+    setStatus(error.message, true);
+  } finally {
+    setBusy(false);
+  }
+}
 
-    if (!tabs.length) {
-      setStatus(
-        "Could not determine the current window.",
-        true
-      );
-      return;
-    }
+async function withCurrentWindow(type) {
+  const windowId = await currentWindowId();
 
-    const response = await sendMessage({
-      type: "ARCIFY_SAVE_GROUPS",
-      windowId: tabs[0].windowId
-    });
+  if (windowId === null) {
+    throw new Error("Arcify could not determine the current Chrome window.");
+  }
 
-    if (!response?.ok) {
-      setStatus(
-        response?.error ||
-          "Could not save groups.",
-        true
-      );
-      return;
-    }
+  return send(type, { windowId });
+}
 
-    await renderGroups();
+document.getElementById("save-workspace").addEventListener("click", () => {
+  run(
+    () => withCurrentWindow("ARCIFY_SAVE_WORKSPACE"),
+    "Saved this window as the Arcify workspace."
+  );
+});
 
-    setStatus(
-      `Saved ${response.groups.length} group(s).`
-    );
-  });
+document.getElementById("open-window").addEventListener("click", () => {
+  run(
+    () => send("ARCIFY_OPEN_WINDOW"),
+    "Opened a new Arcify window."
+  );
+});
 
-document
-  .getElementById("apply")
-  .addEventListener("click", async () => {
-    setStatus("Applying...");
+document.getElementById("restore-favorites").addEventListener("click", () => {
+  run(
+    () => withCurrentWindow("ARCIFY_RESTORE_FAVORITES"),
+    "Restored saved favorites in this window."
+  );
+});
 
-    const response = await sendMessage({
-      type: "ARCIFY_APPLY_GROUPS"
-    });
+document.getElementById("restore-groups").addEventListener("click", () => {
+  run(
+    () => withCurrentWindow("ARCIFY_RESTORE_GROUPS"),
+    "Restored saved groups in this window."
+  );
+});
 
-    if (!response?.ok) {
-      setStatus(
-        response?.error ||
-          "Could not apply groups.",
-        true
-      );
-      return;
-    }
+document.getElementById("save-favorites").addEventListener("click", () => {
+  run(
+    () => withCurrentWindow("ARCIFY_SAVE_FAVORITES"),
+    "Saved the pinned tabs from this window."
+  );
+});
 
-    setStatus("Groups applied.");
-  });
+document.getElementById("save-groups").addEventListener("click", () => {
+  run(
+    () => withCurrentWindow("ARCIFY_SAVE_GROUPS"),
+    "Saved the tab groups from this window."
+  );
+});
 
-document
-  .getElementById("clear")
-  .addEventListener("click", async () => {
-    const response = await sendMessage({
-      type: "ARCIFY_CLEAR_GROUPS"
-    });
+document.getElementById("clear-all").addEventListener("click", () => {
+  if (!window.confirm("Clear all saved Arcify favorites and groups? Existing Chrome tabs will not be closed.")) {
+    return;
+  }
 
-    if (!response?.ok) {
-      setStatus(
-        response?.error ||
-          "Could not clear groups.",
-        true
-      );
-      return;
-    }
+  run(
+    () => send("ARCIFY_CLEAR_ALL"),
+    "Cleared the saved Arcify workspace."
+  );
+});
 
-    await renderGroups();
-
-    setStatus(
-      "Saved groups cleared. Existing tabs were not closed."
-    );
-  });
-
-renderGroups().catch(error => {
+render().catch(error => {
   setStatus(error.message, true);
 });

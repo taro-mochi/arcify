@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Arcify",
-  "version": "0.7.6",
-  "description": "Arc-style persistent pinned tabs for Chrome",
+  "version": "0.8.0",
+  "minimum_chrome_version": "102",
+  "description": "Deterministic Arc-style favorites, workspaces, and last-tab switching for Chrome",
   "permissions": [
     "tabs",
     "storage",
@@ -16,22 +17,31 @@
       "suggested_key": {
         "mac": "MacCtrl+Period"
       },
-      "description": "Switch to last visited tab"
+      "description": "Switch to the last visited tab"
+    },
+    "open-arcify-window": {
+      "suggested_key": {
+        "mac": "MacCtrl+Shift+9"
+      },
+      "description": "Open a new Arcify window"
     }
   },
   "action": {
     "default_title": "Arcify",
     "default_popup": "popup.html",
     "default_icon": {
-      "16": "icons/icon128.png",
-      "32": "icons/icon128.png"
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
     }
   },
   "icons": {
-    "16": "icons/icon128.png",
-    "32": "icons/icon128.png",
-    "48": "icons/icon128.png",
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
     "128": "icons/icon128.png"
   },
-  "incognito": "not_allowed"
+  "incognito": "not_allowed",
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self';"
+  }
 }

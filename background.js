@@ -1,957 +1,352 @@
-const PIN_SCHEMA_VERSION = 4;
-const UNPIN_DELAY_MS = 700;
-const SUPPRESSION_MS = 3000;
+"use strict";
 
-const NEW_WINDOW_POPULATE_DELAY_MS = 700;
-const BROWSER_STARTUP_GUARD_MS = 5000;
-const DEDUPE_DELAY_MS = 250;
+importScripts("storage.js", "groups.js");
 
-const WINDOW_POPULATION_SESSION_KEY = "arcifyWindowPopulationSession";
+chrome.storage.local
+  .setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" })
+  .catch(() => {});
 
-chrome.storage.local.setAccessLevel({
-  accessLevel: "TRUSTED_CONTEXTS"
-}).catch(error => {
-  console.error("Arcify could not restrict storage access:", error);
-});
+const MRU_KEY_PREFIX = "arcify.mru.";
+let mutationQueue = Promise.resolve();
 
-let queue = Promise.resolve();
-
-const suppressedChanges = new Map();
-
-function enqueue(fn) {
-  queue = queue
-    .then(fn)
-    .catch(error => {
-      console.error("Arcify:", error);
-    });
-
-  return queue;
+function enqueueMutation(operation) {
+  mutationQueue = mutationQueue.then(operation, operation);
+  return mutationQueue;
 }
 
-function getTabUrl(tab) {
-  return tab?.url || tab?.pendingUrl || null;
-}
-
-function isTrackableUrl(url) {
-  return (
-    typeof url === "string" &&
-    (
-      url.startsWith("https://") ||
-      url.startsWith("http://")
-    )
-  );
-}
-
-function siteKey(url) {
-  if (!isTrackableUrl(url)) {
+async function getNormalWindow(windowId) {
+  if (!Number.isInteger(windowId)) {
     return null;
   }
 
   try {
-    return new URL(url).origin;
+    const window = await chrome.windows.get(windowId);
+
+    if (window.type !== "normal" || window.incognito) {
+      return null;
+    }
+
+    return window;
   } catch {
     return null;
   }
 }
 
-function hostname(url) {
-  try {
-    return new URL(url).hostname.replace(/^www\./, "");
-  } catch {
-    return null;
-  }
-}
-
-function makeSite(tab) {
-  const url = getTabUrl(tab);
-  const key = siteKey(url);
-
-  if (!key) {
-    return null;
-  }
-
-  return {
-    name: tab.title || hostname(url) || key,
-    url,
-    key
-  };
-}
-
-async function getPinnedSites() {
-  const result = await chrome.storage.local.get("pinnedSites");
-
-  if (!Array.isArray(result.pinnedSites)) {
-    return [];
-  }
-
-  const seen = new Set();
-  const resultSites = [];
-
-  for (const site of result.pinnedSites) {
-    if (!site || !isTrackableUrl(site.url)) {
-      continue;
-    }
-
-    const key = siteKey(site.url);
-
-    if (!key || seen.has(key)) {
-      continue;
-    }
-
-    seen.add(key);
-
-    resultSites.push({
-      name: site.name || hostname(site.url) || key,
-      url: site.url,
-      key
-    });
-  }
-
-  return resultSites;
-}
-
-async function savePinnedSites(sites) {
-  const seen = new Set();
-
-  const cleaned = [];
-
-  for (const site of sites) {
-    const key = siteKey(site.url);
-
-    if (!key || seen.has(key)) {
-      continue;
-    }
-
-    seen.add(key);
-
-    cleaned.push({
-      name: site.name || hostname(site.url) || key,
-      url: site.url,
-      key
-    });
-  }
-
-  await chrome.storage.local.set({
-    pinnedSites: cleaned,
-    arcifyStateVersion: PIN_SCHEMA_VERSION
-  });
-
-}
-
-function suppressionKey(tabId, pinned) {
-  return `${tabId}:${pinned}`;
-}
-
-function suppress(tabId, pinned) {
-  suppressedChanges.set(
-    suppressionKey(tabId, pinned),
-    Date.now() + SUPPRESSION_MS
-  );
-}
-
-function consumeSuppression(tabId, pinned) {
-  const key = suppressionKey(tabId, pinned);
-
-  const expires = suppressedChanges.get(key);
-
-  if (!expires) {
-    return false;
-  }
-
-  suppressedChanges.delete(key);
-
-  if (Date.now() > expires) {
-    return false;
-  }
-
-  return true;
-}
-
-async function importPinsFromFocusedWindow() {
-  let window;
-
-  try {
-    window = await chrome.windows.getLastFocused();
-  } catch {
-    return [];
-  }
-
-  if (
-    !window ||
-    window.type !== "normal" ||
-    window.incognito
-  ) {
-    return [];
+async function captureFavorites(windowId) {
+  if (!(await getNormalWindow(windowId))) {
+    throw new Error("Arcify can only save favorites from a normal Chrome window.");
   }
 
   const tabs = await chrome.tabs.query({
-    windowId: window.id,
+    windowId,
     pinned: true
   });
 
-  const sites = [];
-  const seen = new Set();
-
-  for (const tab of tabs) {
-    if (tab.incognito) {
-      continue;
-    }
-
-    const site = makeSite(tab);
-
-    if (!site || seen.has(site.key)) {
-      continue;
-    }
-
-    seen.add(site.key);
-    sites.push(site);
-  }
-
-  await savePinnedSites(sites);
-
-
-  return sites;
+  return ArcifyStorage.normalizeFavorites(
+    tabs.sort((a, b) => a.index - b.index).map(tab => ({
+      url: tab.url || tab.pendingUrl
+    }))
+  );
 }
 
-async function addPinnedSite(tab) {
-  const site = makeSite(tab);
-
-  if (!site) {
-    return false;
+async function restoreFavorites(windowId, favorites) {
+  if (!(await getNormalWindow(windowId))) {
+    return { restored: 0, failed: 0 };
   }
 
-  const sites = await getPinnedSites();
+  const normalized = ArcifyStorage.normalizeFavorites(favorites);
+  let tabs;
 
-  if (
-    sites.some(existing =>
-      existing.key === site.key
-    )
-  ) {
-    return false;
+  try {
+    tabs = await chrome.tabs.query({ windowId });
+  } catch {
+    return { restored: 0, failed: normalized.length };
   }
 
-  sites.push(site);
+  const usedTabIds = new Set();
+  let restored = 0;
+  let failed = 0;
 
-  await savePinnedSites(sites);
+  for (let index = 0; index < normalized.length; index += 1) {
+    const favorite = normalized[index];
 
+    let tab =
+      tabs.find(candidate => {
+        return (
+          !usedTabIds.has(candidate.id) &&
+          candidate.pinned &&
+          ArcifyStorage.favoriteKey(candidate.url || candidate.pendingUrl) === favorite.key
+        );
+      }) ||
+      tabs.find(candidate => {
+        return (
+          !usedTabIds.has(candidate.id) &&
+          !candidate.pinned &&
+          candidate.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE &&
+          ArcifyStorage.favoriteKey(candidate.url || candidate.pendingUrl) === favorite.key
+        );
+      }) ||
+      null;
+
+    if (!tab) {
+      try {
+        tab = await chrome.tabs.create({
+          windowId,
+          url: favorite.url,
+          pinned: true,
+          active: false,
+          index
+        });
+        tabs.push(tab);
+      } catch {
+        failed += 1;
+        continue;
+      }
+    }
+
+    usedTabIds.add(tab.id);
+
+    try {
+      if (!tab.pinned) {
+        tab = await chrome.tabs.update(tab.id, { pinned: true });
+      }
+
+      await chrome.tabs.move(tab.id, { index });
+      restored += 1;
+    } catch {
+      failed += 1;
+    }
+  }
+
+  return { restored, failed };
+}
+
+async function saveFavorites(windowId) {
+  const favorites = await captureFavorites(windowId);
+  const config = await ArcifyStorage.replaceFavorites(favorites);
+  return { favorites: config.favorites.length };
+}
+
+async function saveGroups(windowId) {
+  const groups = await ArcifyGroups.capture(windowId);
+  const config = await ArcifyStorage.replaceGroups(groups);
+  return { groups: config.groups.length };
+}
+
+async function saveWorkspace(windowId) {
+  const [favorites, groups] = await Promise.all([
+    captureFavorites(windowId),
+    ArcifyGroups.capture(windowId)
+  ]);
+
+  const config = await ArcifyStorage.replaceWorkspace({ favorites, groups });
+
+  return {
+    favorites: config.favorites.length,
+    groups: config.groups.length
+  };
+}
+
+async function restoreFavoritesFromConfig(windowId) {
+  const config = await ArcifyStorage.readConfig();
+  return restoreFavorites(windowId, config.favorites);
+}
+
+async function restoreGroupsFromConfig(windowId) {
+  const config = await ArcifyStorage.readConfig();
+  return ArcifyGroups.restore(windowId, config.groups);
+}
+
+async function restoreWorkspaceFromConfig(windowId) {
+  const config = await ArcifyStorage.readConfig();
+  const favorites = await restoreFavorites(windowId, config.favorites);
+  const groups = await ArcifyGroups.restore(windowId, config.groups);
+  return { favorites, groups };
+}
+
+async function openArcifyWindow() {
+  let window;
+
+  try {
+    window = await chrome.windows.create({ focused: true });
+  } catch {
+    throw new Error("Chrome could not create a new Arcify window.");
+  }
+
+  if (!window?.id) {
+    throw new Error("Chrome did not return a valid window.");
+  }
+
+  const result = await restoreWorkspaceFromConfig(window.id);
+
+  return {
+    windowId: window.id,
+    ...result
+  };
+}
+
+async function getStatus() {
+  const config = await ArcifyStorage.readConfig();
+
+  return {
+    favorites: config.favorites.length,
+    groups: config.groups.length,
+    links: config.groups.reduce((total, group) => total + group.links.length, 0)
+  };
+}
+
+function isTrustedMessage(sender) {
+  return sender?.id === chrome.runtime.id;
+}
+
+function validWindowId(value) {
+  return Number.isInteger(value) && value >= 0;
+}
+
+async function handleMessage(message, sender) {
+  if (!isTrustedMessage(sender) || !message || typeof message.type !== "string") {
+    throw new Error("Invalid Arcify request.");
+  }
+
+  switch (message.type) {
+    case "ARCIFY_GET_STATUS":
+      return getStatus();
+
+    case "ARCIFY_SAVE_FAVORITES":
+      if (!validWindowId(message.windowId)) throw new Error("Invalid Chrome window.");
+      return enqueueMutation(() => saveFavorites(message.windowId));
+
+    case "ARCIFY_SAVE_GROUPS":
+      if (!validWindowId(message.windowId)) throw new Error("Invalid Chrome window.");
+      return enqueueMutation(() => saveGroups(message.windowId));
+
+    case "ARCIFY_SAVE_WORKSPACE":
+      if (!validWindowId(message.windowId)) throw new Error("Invalid Chrome window.");
+      return enqueueMutation(() => saveWorkspace(message.windowId));
+
+    case "ARCIFY_RESTORE_FAVORITES":
+      if (!validWindowId(message.windowId)) throw new Error("Invalid Chrome window.");
+      return enqueueMutation(() => restoreFavoritesFromConfig(message.windowId));
+
+    case "ARCIFY_RESTORE_GROUPS":
+      if (!validWindowId(message.windowId)) throw new Error("Invalid Chrome window.");
+      return enqueueMutation(() => restoreGroupsFromConfig(message.windowId));
+
+    case "ARCIFY_RESTORE_WORKSPACE":
+      if (!validWindowId(message.windowId)) throw new Error("Invalid Chrome window.");
+      return enqueueMutation(() => restoreWorkspaceFromConfig(message.windowId));
+
+    case "ARCIFY_OPEN_WINDOW":
+      return enqueueMutation(openArcifyWindow);
+
+    case "ARCIFY_CLEAR_FAVORITES":
+      return enqueueMutation(async () => {
+        const config = await ArcifyStorage.clearFavorites();
+        return { favorites: config.favorites.length };
+      });
+
+    case "ARCIFY_CLEAR_GROUPS":
+      return enqueueMutation(async () => {
+        const config = await ArcifyStorage.clearGroups();
+        return { groups: config.groups.length };
+      });
+
+    case "ARCIFY_CLEAR_ALL":
+      return enqueueMutation(async () => {
+        await ArcifyStorage.clearAll();
+        return { favorites: 0, groups: 0 };
+      });
+
+    default:
+      throw new Error("Unknown Arcify request.");
+  }
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  handleMessage(message, sender)
+    .then(result => sendResponse({ ok: true, ...result }))
+    .catch(error => {
+      sendResponse({
+        ok: false,
+        error: typeof error?.message === "string" ? error.message : "Arcify could not complete the request."
+      });
+    });
 
   return true;
+});
+
+function mruKey(windowId) {
+  return `${MRU_KEY_PREFIX}${windowId}`;
 }
 
-async function removePinnedSite(tab) {
-  const url = getTabUrl(tab);
-  const key = siteKey(url);
-
-  if (!key) {
-    return null;
-  }
-
-  const sites = await getPinnedSites();
-
-  const existing = sites.find(
-    site => site.key === key
-  );
-
-  if (!existing) {
-    return null;
-  }
-
-  await savePinnedSites(
-    sites.filter(
-      site => site.key !== key
-    )
-  );
-
-
-  return existing;
-}
-
-async function safelySetPinned(tabId, pinned) {
-  suppress(tabId, pinned);
-
-  try {
-    return await chrome.tabs.update(
-      tabId,
-      {
-        pinned
-      }
-    );
-  } catch (error) {
-    suppressedChanges.delete(
-      suppressionKey(tabId, pinned)
-    );
-
-    throw error;
-  }
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-async function initializeWindowPopulationSession() {
-  const result = await chrome.storage.session.get(
-    WINDOW_POPULATION_SESSION_KEY
-  );
-
-  if (result[WINDOW_POPULATION_SESSION_KEY]) {
-    return;
-  }
-
-  await chrome.storage.session.set({
-    [WINDOW_POPULATION_SESSION_KEY]: {
-      startupGuardUntil: Date.now() + BROWSER_STARTUP_GUARD_MS
-    }
-  });
-}
-
-async function isWindowPopulationAllowed() {
-  const result = await chrome.storage.session.get(
-    WINDOW_POPULATION_SESSION_KEY
-  );
-
-  const session = result[WINDOW_POPULATION_SESSION_KEY];
-
-  if (!session) {
-    return false;
-  }
-
-  return Date.now() >= session.startupGuardUntil;
-}
-
-async function allowWindowPopulationNow() {
-  await chrome.storage.session.set({
-    [WINDOW_POPULATION_SESSION_KEY]: {
-      startupGuardUntil: 0
-    }
-  });
-}
-
-async function dedupePinnedTabsInWindow(windowId) {
-  let window;
-
-  try {
-    window = await chrome.windows.get(windowId);
-  } catch {
-    return;
-  }
-
-  if (
-    window.type !== "normal" ||
-    window.incognito
-  ) {
-    return;
-  }
-
-  const sites = await getPinnedSites();
-  const savedKeys = new Set(
-    sites.map(site => site.key)
-  );
-
-  let tabs;
-
-  try {
-    tabs = await chrome.tabs.query({
-      windowId,
-      pinned: true
-    });
-  } catch {
-    return;
-  }
-
-  const tabsByKey = new Map();
-
-  for (const tab of tabs) {
-    const key = siteKey(getTabUrl(tab));
-
-    if (!key || !savedKeys.has(key)) {
-      continue;
-    }
-
-    if (!tabsByKey.has(key)) {
-      tabsByKey.set(key, []);
-    }
-
-    tabsByKey.get(key).push(tab);
-  }
-
-  for (const matches of tabsByKey.values()) {
-    if (matches.length <= 1) {
-      continue;
-    }
-
-    matches.sort(
-      (a, b) => a.index - b.index
-    );
-
-    const [, ...duplicates] = matches;
-
-    for (const duplicate of duplicates) {
-      try {
-        await safelySetPinned(
-          duplicate.id,
-          false
-        );
-      } catch {
-      }
-    }
-  }
-}
-
-async function dedupeAllWindows() {
-  const windows = await chrome.windows.getAll({
-    windowTypes: ["normal"]
-  });
-
-  for (const window of windows) {
-    if (!window.incognito) {
-      await dedupePinnedTabsInWindow(
-        window.id
-      );
-    }
-  }
-}
-
-async function ensureSiteInWindow(
-  windowId,
-  site,
-  index
-) {
-  let window;
-
-  try {
-    window = await chrome.windows.get(windowId);
-  } catch {
-    return;
-  }
-
-  if (
-    window.type !== "normal" ||
-    window.incognito
-  ) {
-    return;
-  }
-
-  let tabs;
-
-  try {
-    tabs = await chrome.tabs.query({
-      windowId
-    });
-  } catch {
-    return;
-  }
-
-  const matches = tabs.filter(tab =>
-    siteKey(getTabUrl(tab)) === site.key
-  );
-
-  let tab =
-    matches.find(candidate => candidate.pinned) ||
-    matches[0] ||
-    null;
-
-  if (!tab) {
-    try {
-      tab = await chrome.tabs.create({
-        windowId,
-        url: site.url,
-        active: false,
-        index
-      });
-    } catch {
-      return;
-    }
-  }
-
-  try {
-    if (!tab.pinned) {
-      tab = await safelySetPinned(
-        tab.id,
-        true
-      );
-    }
-
-    await chrome.tabs.move(
-      tab.id,
-      { index }
-    );
-  } catch {
-    return;
-  }
-
-  await dedupePinnedTabsInWindow(windowId);
-}
-
-async function populateNewWindow(windowId) {
-  await initializeWindowPopulationSession();
-  await sleep(NEW_WINDOW_POPULATE_DELAY_MS);
-
-  if (!await isWindowPopulationAllowed()) {
-    return;
-  }
-
-  let window;
-  let pinnedTabs;
-
-  try {
-    window = await chrome.windows.get(windowId);
-
-    if (
-      window.type !== "normal" ||
-      window.incognito
-    ) {
-      return;
-    }
-
-    pinnedTabs = await chrome.tabs.query({
-      windowId,
-      pinned: true
-    });
-  } catch {
-    return;
-  }
-
-  // If Chrome already has any pinned tabs, this is an
-  // existing/restored window. Never create another set.
-  if (pinnedTabs.length > 0) {
-    await dedupePinnedTabsInWindow(windowId);
-    return;
-  }
-
-  // Tab groups may already have added ordinary tabs.
-  // That does not matter: zero pinned tabs means this
-  // window still needs its Arcify favorites.
-  const sites = await getPinnedSites();
-
-  for (
-    let index = 0;
-    index < sites.length;
-    index++
-  ) {
-    await ensureSiteInWindow(
-      windowId,
-      sites[index],
-      index
-    );
-  }
-}
-
-async function propagateNewFavorite(site) {
-  const windows = await chrome.windows.getAll({
-    windowTypes: ["normal"]
-  });
-
-  const sites = await getPinnedSites();
-  const index = sites.findIndex(
-    saved => saved.key === site.key
-  );
-
-  for (const window of windows) {
-    if (window.incognito) {
-      continue;
-    }
-
-    await ensureSiteInWindow(
-      window.id,
-      site,
-      Math.max(index, 0)
-    );
-  }
-}
-
-async function unpinSiteEverywhere(site) {
-  const windows =
-    await chrome.windows.getAll({
-      windowTypes: ["normal"]
-    });
-
-  for (const window of windows) {
-    if (window.incognito) {
-      continue;
-    }
-
-    let tabs;
-
-    try {
-      tabs =
-        await chrome.tabs.query({
-          windowId: window.id
-        });
-    } catch {
-      continue;
-    }
-
-    for (const tab of tabs) {
-      if (!tab.pinned) {
-        continue;
-      }
-
-      if (
-        siteKey(getTabUrl(tab)) !==
-        site.key
-      ) {
-        continue;
-      }
-
-      try {
-        await safelySetPinned(
-          tab.id,
-          false
-        );
-      } catch {
-      }
-    }
-  }
-}
-
-async function confirmManualUnpin(tabId) {
-  let tab;
-
-  try {
-    tab =
-      await chrome.tabs.get(tabId);
-  } catch {
-
-    return;
-  }
-
-  if (
-    tab.incognito ||
-    tab.pinned
-  ) {
-    return;
-  }
-
-  const removed =
-    await removePinnedSite(tab);
-
-  if (removed) {
-    await unpinSiteEverywhere(
-      removed
-    );
-  }
-}
-
-chrome.tabs.onUpdated.addListener(
-  (tabId, changeInfo, tab) => {
-    if (
-      typeof changeInfo.pinned !==
-      "boolean"
-    ) {
-      return;
-    }
-
-    if (tab.incognito) {
-      return;
-    }
-
-    if (
-      consumeSuppression(
-        tabId,
-        changeInfo.pinned
-      )
-    ) {
-
-      return;
-    }
-
-    if (changeInfo.pinned) {
-      enqueue(async () => {
-        const added =
-          await addPinnedSite(tab);
-
-        if (added) {
-          const site = makeSite(tab);
-
-          if (site) {
-            await propagateNewFavorite(site);
-          }
-        } else {
-          await dedupePinnedTabsInWindow(
-            tab.windowId
-          );
-        }
-      });
-
-      return;
-    }
-
-    setTimeout(() => {
-      enqueue(
-        () =>
-          confirmManualUnpin(tabId)
-      );
-    }, UNPIN_DELAY_MS);
-  }
-);
-
-chrome.windows.onCreated.addListener(
-  window => {
-    if (
-      window.type !== "normal" ||
-      window.incognito
-    ) {
-      return;
-    }
-
-    populateNewWindow(
-      window.id
-    ).catch(error => {
-      console.error(
-        "Arcify could not initialize new window:",
-        error
-      );
-    });
-  }
-);
-
-chrome.runtime.onStartup.addListener(
-  () => {
-    enqueue(async () => {
-      await initializeWindowPopulationSession();
-      await dedupeAllWindows();
-    });
-  }
-);
-
-async function restoreSavedPinsInFocusedWindow() {
-  let window;
-
-  try {
-    window = await chrome.windows.getLastFocused();
-  } catch {
-    return;
-  }
-
-  if (
-    !window ||
-    window.type !== "normal" ||
-    window.incognito
-  ) {
-    return;
-  }
-
-  let currentPinnedTabs;
-
-  try {
-    currentPinnedTabs = await chrome.tabs.query({
-      windowId: window.id,
-      pinned: true
-    });
-  } catch {
-    return;
-  }
-
-  // Extension reload must be conservative.
-  //
-  // Existing pinned tabs survive an extension reload. If this
-  // window already has pins, do not attempt to "repair" it:
-  // redirects and partially loaded apps can make an existing
-  // tab temporarily look different from its saved URL and
-  // cause a duplicate to be created.
-  //
-  // We only reconstruct favorites when the window has no
-  // pinned tabs at all.
-  if (currentPinnedTabs.length > 0) {
-    await dedupePinnedTabsInWindow(
-      window.id
-    );
-
-    return;
-  }
-
-  const sites = await getPinnedSites();
-
-  for (
-    let index = 0;
-    index < sites.length;
-    index++
-  ) {
-    await ensureSiteInWindow(
-      window.id,
-      sites[index],
-      index
-    );
-  }
-
-  await dedupePinnedTabsInWindow(
-    window.id
-  );
-}
-
-chrome.runtime.onInstalled.addListener(
-  details => {
-    enqueue(async () => {
-      await allowWindowPopulationNow();
-
-      const result =
-        await chrome.storage.local.get(
-          "arcifyStateVersion"
-        );
-
-      if (
-        result.arcifyStateVersion !==
-        PIN_SCHEMA_VERSION
-      ) {
-        await importPinsFromFocusedWindow();
-      }
-
-      // Reloading an unpacked extension is reported by Chrome
-      // as an extension update. This is an explicit user/dev
-      // action, so restoring saved pins in the focused window
-      // is safe.
-      if (
-        details.reason === "install" ||
-        details.reason === "update"
-      ) {
-        await restoreSavedPinsInFocusedWindow();
-        return;
-      }
-
-      // Chrome/browser lifecycle events must never create
-      // missing favorites inside restored windows.
-      await dedupeAllWindows();
-    });
-  }
-);
-
-// ============================================================
-// MRU TAB SWITCHING
-//
-// Control + Period internally.
-// Karabiner will later translate Control + ` -> Control + Period.
-//
-// storage.session survives service-worker sleep, but clears
-// when Chrome fully exits, which is exactly what we want for
-// tab history.
-// ============================================================
-
-function mruStorageKey(windowId) {
-  return `arcify_mru_${windowId}`;
-}
-
-async function recordTabActivation(activeInfo) {
-  const key = mruStorageKey(activeInfo.windowId);
-
-  const result =
-    await chrome.storage.session.get(key);
-
-  const state = result[key] || {
+async function recordTabActivation({ windowId, tabId }) {
+  const key = mruKey(windowId);
+  const stored = await chrome.storage.session.get(key);
+  const state = stored[key] || {
     currentTabId: null,
     previousTabId: null
   };
 
-  if (state.currentTabId === activeInfo.tabId) {
+  if (state.currentTabId === tabId) {
     return;
   }
 
-  const newState = {
-    previousTabId: state.currentTabId,
-    currentTabId: activeInfo.tabId
-  };
-
   await chrome.storage.session.set({
-    [key]: newState
+    [key]: {
+      previousTabId: state.currentTabId,
+      currentTabId: tabId
+    }
   });
 }
 
 async function switchToLastTab() {
-  const activeTabs = await chrome.tabs.query({
+  const [currentTab] = await chrome.tabs.query({
     active: true,
     lastFocusedWindow: true
   });
 
-  const currentTab = activeTabs[0];
-
-  if (!currentTab) {
+  if (!currentTab?.id || !Number.isInteger(currentTab.windowId)) {
     return;
   }
 
-  const key = mruStorageKey(currentTab.windowId);
+  const key = mruKey(currentTab.windowId);
+  const stored = await chrome.storage.session.get(key);
+  const previousTabId = stored[key]?.previousTabId;
 
-  const result =
-    await chrome.storage.session.get(key);
-
-  const state = result[key];
-
-  if (
-    !state ||
-    !state.previousTabId
-  ) {
+  if (!Number.isInteger(previousTabId)) {
     return;
   }
-
-  let previousTab;
 
   try {
-    previousTab =
-      await chrome.tabs.get(
-        state.previousTabId
-      );
-  } catch {
-    return;
-  }
+    const previousTab = await chrome.tabs.get(previousTabId);
 
-  if (
-    previousTab.windowId !==
-    currentTab.windowId
-  ) {
-    return;
-  }
-
-  await chrome.tabs.update(
-    previousTab.id,
-    {
-      active: true
+    if (previousTab.windowId === currentTab.windowId) {
+      await chrome.tabs.update(previousTabId, { active: true });
     }
-  );
+  } catch {
+    await chrome.storage.session.remove(key);
+  }
 }
 
-chrome.tabs.onActivated.addListener(
-  activeInfo => {
-    recordTabActivation(activeInfo)
-      .catch(console.error);
+chrome.tabs.onActivated.addListener(activeInfo => {
+  recordTabActivation(activeInfo).catch(() => {});
+});
 
-    setTimeout(() => {
-      enqueue(
-        () =>
-          dedupePinnedTabsInWindow(
-            activeInfo.windowId
-          )
-      );
-    }, DEDUPE_DELAY_MS);
+chrome.windows.onRemoved.addListener(windowId => {
+  chrome.storage.session.remove(mruKey(windowId)).catch(() => {});
+});
+
+chrome.commands.onCommand.addListener(command => {
+  if (command === "switch-last-tab") {
+    switchToLastTab().catch(() => {});
+    return;
   }
-);
 
-
-chrome.windows.onFocusChanged.addListener(
-  windowId => {
-    if (
-      windowId ===
-      chrome.windows.WINDOW_ID_NONE
-    ) {
-      return;
-    }
-
-    enqueue(
-      () =>
-        dedupePinnedTabsInWindow(
-          windowId
-        )
-    );
+  if (command === "open-arcify-window") {
+    enqueueMutation(openArcifyWindow).catch(() => {});
   }
-);
+});
 
-chrome.commands.onCommand.addListener(
-  command => {
-    if (command !== "switch-last-tab") {
-      return;
-    }
-
-    switchToLastTab()
-      .catch(console.error);
-  }
-);
-
-importScripts("groups.js");
+chrome.runtime.onInstalled.addListener(() => {
+  ArcifyStorage.readConfig().catch(() => {});
+});
